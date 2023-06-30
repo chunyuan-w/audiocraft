@@ -182,6 +182,9 @@ class StreamingMultiheadAttention(StreamingModule):
         self.safe_streaming = safe_streaming
         self.num_heads = num_heads
         self.dropout = dropout
+        self.bias = bias
+        self.device = device
+        self.dtype = dtype
         self.kv_repeat = kv_repeat
         if cross_attention:
             assert not causal, "Causal cannot work with cross attention."
@@ -199,6 +202,7 @@ class StreamingMultiheadAttention(StreamingModule):
             kv_dim = (embed_dim // num_heads) * num_kv
             out_dim += 2 * kv_dim
             in_proj = nn.Linear(embed_dim, out_dim, bias=bias, **factory_kwargs)
+            self.out_dim = out_dim
             # We try to follow the default PyTorch MHA convention, to easily compare results.
             self.in_proj_weight = in_proj.weight
             self.in_proj_bias = in_proj.bias
@@ -313,6 +317,9 @@ class StreamingMultiheadAttention(StreamingModule):
         streaming_offset = past_context_offset + past_keys_offset
         return self.rope.rotate_qk(query, key, start=streaming_offset)
 
+    def _calculate_projected(self, query):
+        return nn.functional.linear(query, self.in_proj_weight, self.in_proj_bias)
+
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 key_padding_mask=None, need_weights=False, attn_mask=None,
                 average_attn_weights=True, is_causal=False):
@@ -363,7 +370,8 @@ class StreamingMultiheadAttention(StreamingModule):
                     # profiling breaks that propertysomehow.
                     assert query is key, "specialized implementation"
                     assert value is key, "specialized implementation"
-                projected = nn.functional.linear(query, self.in_proj_weight, self.in_proj_bias)
+                # projected = nn.functional.linear(query, self.in_proj_weight, self.in_proj_bias)
+                projected = self._calculate_projected(query)
                 if self.kv_repeat == 1:
                     if time_dim == 2:
                         bound_layout = "b h p t d"
@@ -441,6 +449,16 @@ class StreamingMultiheadAttention(StreamingModule):
 
         return x, None
 
+
+class StreamingMultiheadAttentionLinearModule(StreamingMultiheadAttention):
+    def _set_projected_linear(self):
+        if not hasattr(self, "projected_linear"):
+            self.projected_linear = nn.Linear(self.embed_dim, self.out_dim)
+            self.projected_linear.weight = self.in_proj_weight
+            self.projected_linear.bias = self.in_proj_bias            
+        
+    def _calculate_projected(self, query):
+        return self.projected_linear(query)
 
 class StreamingTransformerLayer(nn.TransformerEncoderLayer):
     """TransformerLayer with Streaming / Causal support.
